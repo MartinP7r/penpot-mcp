@@ -65,7 +65,7 @@ describe('PenpotRpcError', () => {
 })
 
 // ---------------------------------------------------------------------------
-// PenpotStaleWriteError
+// PenpotStaleWriteError compatibility
 // ---------------------------------------------------------------------------
 
 describe('PenpotStaleWriteError', () => {
@@ -81,10 +81,11 @@ describe('PenpotStaleWriteError', () => {
     expect(err.result).toBe(fakeResult)
   })
 
-  it('includes laggedCount and new revn in the message', () => {
+  it('does not infer another writer or a current revision from lagged', () => {
     const err = new PenpotStaleWriteError(2, fakeResult)
-    expect(err.message).toContain('2 concurrent change-set(s)')
-    expect(err.message).toContain('revn: 42')
+    expect(err.message).toContain('reported 2 lagged change-set(s)')
+    expect(err.message).toContain('response revn: 42')
+    expect(err.message).not.toMatch(/concurrent|another session|new revn/i)
   })
 
   it('mentions re-fetching in the message', () => {
@@ -281,48 +282,44 @@ describe('PenpotRpcClient', () => {
     })
   })
 
-  // --- updateFile / stale-write detection ---
+  // --- updateFile result handling ---
 
-  describe('updateFile stale-write detection', () => {
+  describe('updateFile result handling', () => {
     const cleanResult = { revn: 10, lagged: [] }
     const laggedResult = {
-      revn: 12,
+      // Penpot may report the request's pre-update revn here, and may include
+      // the caller's own change-set in lagged. Both values are diagnostics.
+      revn: 9,
       lagged: [
-        { id: 'cs1', revn: 11, fileId: 'file-abc', sessionId: 'other-session', changes: [] },
+        { id: 'cs1', revn: 9, fileId: 'file-abc', sessionId: 'caller-session', changes: [] },
       ],
     }
 
-    it('returns the result when lagged is empty (no concurrent edits)', async () => {
+    it('returns the result when lagged is empty', async () => {
       fetchMock.mockResolvedValueOnce(mockResponse(200, JSON.stringify(cleanResult)))
       const result = await client.updateFile('file-abc', 9, 0, [])
       expect(result).toEqual(cleanResult)
     })
 
-    it('throws PenpotStaleWriteError when lagged is non-empty', async () => {
+    it('returns a successful self-lagged response unchanged after one request', async () => {
       fetchMock.mockResolvedValueOnce(mockResponse(200, JSON.stringify(laggedResult)))
-      const err = await client.updateFile('file-abc', 9, 0, []).catch((e: unknown) => e)
-      expect(err).toBeInstanceOf(PenpotStaleWriteError)
+      const result = await client.updateFile('file-abc', 9, 0, [], 'caller-session')
+      expect(result).toEqual(laggedResult)
+      expect(result.revn).toBe(9)
+      expect(result.lagged).toEqual(laggedResult.lagged)
+      expect(fetchMock).toHaveBeenCalledOnce()
     })
 
-    it('PenpotStaleWriteError.laggedCount matches the number of lagged change-sets', async () => {
-      const multiLagged = {
-        revn: 15,
-        lagged: [
-          { id: 'cs1', revn: 11, fileId: 'f', sessionId: 's', changes: [] },
-          { id: 'cs2', revn: 12, fileId: 'f', sessionId: 's', changes: [] },
-          { id: 'cs3', revn: 13, fileId: 'f', sessionId: 's', changes: [] },
-        ],
-      }
-      fetchMock.mockResolvedValueOnce(mockResponse(200, JSON.stringify(multiLagged)))
-      const err = await client.updateFile('file-abc', 9, 0, []).catch((e: unknown) => e)
-      expect(err).toBeInstanceOf(PenpotStaleWriteError)
-      expect((err as PenpotStaleWriteError).laggedCount).toBe(3)
-    })
+    it('preserves an update-file HTTP error even if its body includes lagged', async () => {
+      const errorBody = { error: 'revision-conflict', lagged: laggedResult.lagged }
+      fetchMock.mockResolvedValueOnce(mockResponse(409, JSON.stringify(errorBody)))
 
-    it('PenpotStaleWriteError.result carries the update-file response (including new revn)', async () => {
-      fetchMock.mockResolvedValueOnce(mockResponse(200, JSON.stringify(laggedResult)))
-      const err = await client.updateFile('file-abc', 9, 0, []).catch((e: unknown) => e)
-      expect((err as PenpotStaleWriteError).result.revn).toBe(12)
+      const err = await client.updateFile('file-abc', 9, 0, [], 'caller-session').catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(PenpotRpcError)
+      expect((err as PenpotRpcError).method).toBe('update-file')
+      expect((err as PenpotRpcError).status).toBe(409)
+      expect((err as PenpotRpcError).body).toEqual(errorBody)
+      expect(fetchMock).toHaveBeenCalledOnce()
     })
 
     it('does not throw when lagged field is missing from the response', async () => {

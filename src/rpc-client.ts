@@ -19,17 +19,14 @@ export class PenpotRpcError extends Error {
 }
 
 /**
- * Thrown by `updateFile` when Penpot reports that changes from another session
- * landed before ours (i.e. `lagged` in the `update-file` response is non-empty).
+ * @deprecated `updateFile` no longer throws for a non-empty `lagged` response.
+ * Kept as an export for callers that chose to construct this compatibility error.
  *
- * The write DID succeed — Penpot applied our changes on top of the lagged ones —
- * but the resulting file state may not be what was intended. The caller should
- * re-fetch the file (`penpot_get_file_snapshot`) and verify the current state
- * before making further edits.
- *
- * `result` contains the `update-file` response (including the new `revn`) so
- * callers that can tolerate concurrent edits may inspect it rather than treating
- * this as a hard failure.
+ * `lagged` is a server diagnostic: it can include the caller's own change-set,
+ * so it does not by itself establish another writer or a concurrent edit. The
+ * response `revn` is also server-reported and is not guaranteed to be the
+ * current revision after the write. Re-fetch the file before a follow-up edit
+ * when the current state matters.
  */
 export class PenpotStaleWriteError extends Error {
   constructor(
@@ -37,10 +34,9 @@ export class PenpotStaleWriteError extends Error {
     public readonly result: UpdateFileResult,
   ) {
     super(
-      `Stale write detected: ${laggedCount} concurrent change-set(s) from another session ` +
-        `were applied before yours (new revn: ${result.revn}). ` +
-        `Your changes were applied on top — re-fetch the file with penpot_get_file_snapshot ` +
-        `and verify the current state before making further edits.`,
+      `Update response reported ${laggedCount} lagged change-set(s) (response revn: ${result.revn}). ` +
+        `Lagged entries do not by themselves establish another writer or a current revision. ` +
+        `Re-fetch the file with penpot_get_file_snapshot before further edits when the current state matters.`,
     )
   }
 }
@@ -184,6 +180,14 @@ export class PenpotRpcClient {
     return (await this.call('get-file-libraries', 'GET', { 'file-id': fileId })) as FileLibraryEntry[]
   }
 
+  /**
+   * Sends exactly one `update-file` request. Any 2xx response is successful,
+   * including one with non-empty `lagged`, and is returned unchanged so callers
+   * retain the server diagnostic. `lagged` may include this caller's change-set;
+   * it does not by itself prove a concurrent writer. Likewise, the response
+   * `revn` is not labelled as the current or post-write revision. Non-2xx
+   * responses still throw `PenpotRpcError`.
+   */
   async updateFile(
     fileId: string,
     revn: number,
@@ -191,17 +195,13 @@ export class PenpotRpcClient {
     changes: Change[],
     sessionId: string = crypto.randomUUID(),
   ): Promise<UpdateFileResult> {
-    const result = (await this.call('update-file', 'POST', {
+    return (await this.call('update-file', 'POST', {
       id: fileId,
       'session-id': sessionId,
       revn,
       vern,
       changes,
     })) as UpdateFileResult
-    if (result.lagged && result.lagged.length > 0) {
-      throw new PenpotStaleWriteError(result.lagged.length, result)
-    }
-    return result
   }
 
   // --- Media uploads ---
@@ -433,8 +433,13 @@ export type FileSummary = {
 export type Change = Record<string, unknown>
 
 export type UpdateFileResult = {
+  /** Server-reported value; do not assume it is the current revision after this write. */
   revn: number
-  lagged: Array<{ id: string; revn: number; fileId: string; sessionId: string; changes: Change[] }>
+  /**
+   * Optional server diagnostic. Entries can include the caller's own change-set
+   * and therefore do not by themselves prove that another writer was concurrent.
+   */
+  lagged?: Array<{ id: string; revn: number; fileId: string; sessionId: string; changes: Change[] }>
 }
 
 /**

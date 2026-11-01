@@ -13,7 +13,7 @@ import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { extname } from 'node:path'
-import type { Change, MediaObject, PenpotRpcClient } from '../rpc-client.js'
+import type { Change, MediaObject, PenpotRpcClient, UpdateFileResult } from '../rpc-client.js'
 import {
   addObj,
   addComponent,
@@ -845,6 +845,60 @@ function buildShapeObject(spec: ShapeSpec, tokens: TokenFile): Record<string, un
   }
 }
 
+/**
+ * Result metadata for a content-tool mutation. `observedRevn` is the revision
+ * read before constructing the change-set; `serverResponseRevn` is only the
+ * value reported by the successful update-file response. Neither claims to be
+ * the file's current revision after the request returns.
+ */
+export type MutationDiagnostics = {
+  status: 'applied' | 'no-op'
+  observedRevn: number
+  serverResponseRevn: number | null
+  /** Count only: never expose server-supplied lagged entries or their contents. */
+  laggedCount: number | null
+}
+
+type MutationResponse = {
+  /** @deprecated Use `mutation.serverResponseRevn` or `mutation.observedRevn`. */
+  revn: number
+  mutation: MutationDiagnostics
+}
+
+function withAppliedMutationDiagnostics<T extends object>(
+  value: T,
+  observedRevn: number,
+  response: UpdateFileResult,
+): T & MutationResponse {
+  return {
+    ...value,
+    // Preserve the established response shape for callers that still read
+    // `revn`; it is an alias for the server response, not a current revision.
+    revn: response.revn,
+    mutation: {
+      status: 'applied',
+      observedRevn,
+      serverResponseRevn: response.revn,
+      laggedCount: response.lagged?.length ?? null,
+    },
+  }
+}
+
+function withNoOpMutationDiagnostics<T extends object>(value: T, observedRevn: number): T & MutationResponse {
+  return {
+    ...value,
+    // Preserve the historical no-op value while exposing its distinct meaning
+    // through the explicit diagnostic fields.
+    revn: observedRevn,
+    mutation: {
+      status: 'no-op',
+      observedRevn,
+      serverResponseRevn: null,
+      laggedCount: null,
+    },
+  }
+}
+
 const createPageInput = z.object({
   fileId: z.string().min(1),
   name: z.string().min(1),
@@ -858,7 +912,7 @@ const createPage: ToolDefinition<z.infer<typeof createPageInput>> = {
     const file = await client.getFile(fileId)
     const pageChange = addPage(name)
     const result = await client.updateFile(fileId, file.revn, file.vern, [pageChange])
-    return { pageId: pageChange.id, pageName: name, revn: result.revn }
+    return withAppliedMutationDiagnostics({ pageId: pageChange.id, pageName: name }, file.revn, result)
   },
 }
 
@@ -896,7 +950,7 @@ const renamePageTool: ToolDefinition<z.infer<typeof renamePageInput>> = {
       throw new Error(`penpot_rename_page: page ${pageId} not found in file ${fileId}`)
     }
     const result = await client.updateFile(fileId, file.revn, file.vern, [renamePage(pageId, name)])
-    return { pageId, name, revn: result.revn }
+    return withAppliedMutationDiagnostics({ pageId, name }, file.revn, result)
   },
 }
 
@@ -918,7 +972,7 @@ const deletePageTool: ToolDefinition<z.infer<typeof deletePageInput>> = {
       throw new Error(`penpot_delete_page: cannot delete the last page of a file`)
     }
     const result = await client.updateFile(fileId, file.revn, file.vern, [delPage(pageId)])
-    return { deleted: pageId, revn: result.revn }
+    return withAppliedMutationDiagnostics({ deleted: pageId }, file.revn, result)
   },
 }
 
@@ -962,7 +1016,7 @@ function makeAddShapes(defaultTokensPath: string): ToolDefinition<z.infer<Return
         return addObj(pageId, obj)
       })
       const result = await client.updateFile(fileId, file.revn, file.vern, changes)
-      return { shapeIds: changes.map((c) => c.id), revn: result.revn }
+      return withAppliedMutationDiagnostics({ shapeIds: changes.map((c) => c.id) }, file.revn, result)
     },
   }
 }
@@ -1321,7 +1375,7 @@ function makeUpdateShapes(defaultTokensPath: string): ToolDefinition<z.infer<Ret
       })
 
       const result = await client.updateFile(fileId, file.revn, file.vern, changes)
-      return { shapeIds: changes.map((c) => c.id), revn: result.revn }
+      return withAppliedMutationDiagnostics({ shapeIds: changes.map((c) => c.id) }, file.revn, result)
     },
   }
 }
@@ -1352,7 +1406,7 @@ const deleteShapes: ToolDefinition<z.infer<typeof deleteShapesInput>> = {
 
     const changes = shapeIds.map((shapeId) => delObj(pageId, shapeId))
     const result = await client.updateFile(fileId, file.revn, file.vern, changes)
-    return { deletedShapeIds: shapeIds, revn: result.revn }
+    return withAppliedMutationDiagnostics({ deletedShapeIds: shapeIds }, file.revn, result)
   },
 }
 
@@ -1400,7 +1454,7 @@ const cloneShapes: ToolDefinition<z.infer<typeof cloneShapesInput>> = {
 
     const result = await client.updateFile(fileId, file.revn, file.vern, changes)
     const clonedRootIds = changesPerRoot.map((rootChanges) => rootChanges[0]!.id)
-    return { clonedRootIds, shapeIds: changes.map((c) => c.id), revn: result.revn }
+    return withAppliedMutationDiagnostics({ clonedRootIds, shapeIds: changes.map((c) => c.id) }, file.revn, result)
   },
 }
 
@@ -1492,7 +1546,7 @@ const reorderShapes: ToolDefinition<z.infer<typeof reorderShapesInput>> = {
     const { change, parentId, order } = buildReorderChange(pageId, objects, shapeId, reorderAction, 'penpot_reorder_shapes')
 
     const result = await client.updateFile(fileId, file.revn, file.vern, [change])
-    return { parentId, order, revn: result.revn }
+    return withAppliedMutationDiagnostics({ parentId, order }, file.revn, result)
   },
 }
 
@@ -1601,11 +1655,11 @@ function makeAlignShapes(defaultTokensPath: string): ToolDefinition<z.infer<Retu
       })
 
       const deltas = computeAlignment(boxes, edge as AlignEdge)
-      if (deltas.length === 0) return { movedShapeIds: [], revn: file.revn }
+      if (deltas.length === 0) return withNoOpMutationDiagnostics({ movedShapeIds: [] }, file.revn)
 
       const changes = expandTranslateChanges(pageId, deltas, objects, tokens, 'penpot_align_shapes')
       const result = await client.updateFile(fileId, file.revn, file.vern, changes)
-      return { movedShapeIds: deltas.map((d) => d.id), revn: result.revn }
+      return withAppliedMutationDiagnostics({ movedShapeIds: deltas.map((d) => d.id) }, file.revn, result)
     },
   }
 }
@@ -1648,11 +1702,11 @@ function makeDistributeShapes(
       })
 
       const deltas = computeDistribution(boxes, axis as DistributeAxis)
-      if (deltas.length === 0) return { movedShapeIds: [], revn: file.revn }
+      if (deltas.length === 0) return withNoOpMutationDiagnostics({ movedShapeIds: [] }, file.revn)
 
       const changes = expandTranslateChanges(pageId, deltas, objects, tokens, 'penpot_distribute_shapes')
       const result = await client.updateFile(fileId, file.revn, file.vern, changes)
-      return { movedShapeIds: deltas.map((d) => d.id), revn: result.revn }
+      return withAppliedMutationDiagnostics({ movedShapeIds: deltas.map((d) => d.id) }, file.revn, result)
     },
   }
 }
@@ -1781,7 +1835,7 @@ function makeBatch(defaultTokensPath: string): ToolDefinition<z.infer<ReturnType
       })
 
       const result = await client.updateFile(fileId, file.revn, file.vern, changes)
-      return { results, revn: result.revn }
+      return withAppliedMutationDiagnostics({ results }, file.revn, result)
     },
   }
 }
@@ -1878,15 +1932,16 @@ const restoreCheckpointTool: ToolDefinition<z.infer<typeof restoreCheckpointInpu
       totalRestored += Object.keys(snapshotObjects).length
     }
 
-    if (changes.length === 0) return { checkpointId, restoredShapeCount: 0, deletedShapeCount: 0, revn: file.revn }
+    if (changes.length === 0) {
+      return withNoOpMutationDiagnostics({ checkpointId, restoredShapeCount: 0, deletedShapeCount: 0 }, file.revn)
+    }
 
     const result = await client.updateFile(fileId, file.revn, file.vern, changes)
-    return {
+    return withAppliedMutationDiagnostics({
       checkpointId,
       restoredShapeCount: totalRestored,
       deletedShapeCount: totalDeleted,
-      revn: result.revn,
-    }
+    }, file.revn, result)
   },
 }
 
@@ -2312,12 +2367,16 @@ const replaceText: ToolDefinition<z.infer<typeof replaceTextInput>> = {
     }
 
     if (changes.length === 0) {
-      return { replacedShapes: [], totalReplacedShapes: 0, totalOccurrences: 0 }
+      return withNoOpMutationDiagnostics({ replacedShapes: [], totalReplacedShapes: 0, totalOccurrences: 0 }, file.revn)
     }
 
     const result = await client.updateFile(fileId, file.revn, file.vern, changes)
     const totalOccurrences = replacedShapes.reduce((sum, s) => sum + s.occurrences, 0)
-    return { replacedShapes, totalReplacedShapes: replacedShapes.length, totalOccurrences, revn: result.revn }
+    return withAppliedMutationDiagnostics(
+      { replacedShapes, totalReplacedShapes: replacedShapes.length, totalOccurrences },
+      file.revn,
+      result,
+    )
   },
 }
 
@@ -2517,7 +2576,11 @@ function makeCreateComponent(
       const registerChange = addComponent(componentId, componentName, rootId, pageId)
 
       const result = await client.updateFile(fileId, file.revn, file.vern, [...addObjChanges, registerChange])
-      return { componentId, mainInstanceId: rootId, shapeIds: objs.map((o) => o.id as string), revn: result.revn }
+      return withAppliedMutationDiagnostics(
+        { componentId, mainInstanceId: rootId, shapeIds: objs.map((o) => o.id as string) },
+        file.revn,
+        result,
+      )
     },
   }
 }
@@ -2638,7 +2701,7 @@ function makeCreateVariantGroup(
       const addObjChanges = [addObj(pageId, containerObj), ...allObjs.map((obj) => addObj(pageId, obj))]
       const result = await client.updateFile(fileId, file.revn, file.vern, [...addObjChanges, ...registerChanges])
 
-      return { variantId, containerId, variants: resultVariants, revn: result.revn }
+      return withAppliedMutationDiagnostics({ variantId, containerId, variants: resultVariants }, file.revn, result)
     },
   }
 }
@@ -2762,12 +2825,11 @@ function makeAddVariant(defaultTokensPath: string): ToolDefinition<z.infer<Retur
         registerChange,
       ]
       const result = await client.updateFile(fileId, file.revn, file.vern, allChanges)
-      return {
+      return withAppliedMutationDiagnostics({
         componentId,
         mainInstanceId: rootId,
         shapeIds: newObjs.map((o) => o.id as string),
-        revn: result.revn,
-      }
+      }, file.revn, result)
     },
   }
 }
@@ -2918,7 +2980,11 @@ function makeAddComponentInstance(): ToolDefinition<z.infer<ReturnType<typeof ma
       const result = await client.updateFile(fileId, file.revn, file.vern, changes)
       const instanceRoot = changes[0]
       if (!instanceRoot) throw new Error('penpot_add_component_instance: clone produced no shapes')
-      return { instanceRootId: instanceRoot.id, shapeIds: changes.map((c) => c.id), revn: result.revn }
+      return withAppliedMutationDiagnostics(
+        { instanceRootId: instanceRoot.id, shapeIds: changes.map((c) => c.id) },
+        file.revn,
+        result,
+      )
     },
   }
 }
@@ -3086,7 +3152,7 @@ const groupShapes: ToolDefinition<z.infer<typeof groupShapesInput>> = {
     ]
 
     const result = await client.updateFile(fileId, file.revn, file.vern, changes)
-    return { groupId, childIds: childrenInZOrder, parentId: sharedParentId, revn: result.revn }
+    return withAppliedMutationDiagnostics({ groupId, childIds: childrenInZOrder, parentId: sharedParentId }, file.revn, result)
   },
 }
 
@@ -3146,7 +3212,7 @@ const ungroupShapes: ToolDefinition<z.infer<typeof ungroupShapesInput>> = {
     ]
 
     const result = await client.updateFile(fileId, file.revn, file.vern, changes)
-    return { ungroupedShapeIds: childIds, parentId: newParentId, revn: result.revn }
+    return withAppliedMutationDiagnostics({ ungroupedShapeIds: childIds, parentId: newParentId }, file.revn, result)
   },
 }
 
