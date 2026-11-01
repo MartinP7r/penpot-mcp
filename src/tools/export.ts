@@ -81,6 +81,19 @@ export const exportBatchInput = exportBatchBaseSchema
     { message: 'Each shape in the shapes array must have a pageId, or supply a top-level pageId as default.' },
   )
 
+function formatExportToolError(err: unknown): string {
+  if (err instanceof PenpotExporterError) {
+    return JSON.stringify({
+      error: {
+        type: 'penpot-exporter-error',
+        method: err.step,
+        status: err.status,
+      },
+    })
+  }
+  return JSON.stringify({ error: { type: 'penpot-export-tool-error' } })
+}
+
 export function registerExportTool(server: McpServer, exporter: PenpotExporterClient): void {
   server.registerTool(
     'penpot_export_shape',
@@ -107,14 +120,8 @@ export function registerExportTool(server: McpServer, exporter: PenpotExporterCl
           ],
         }
       } catch (err) {
-        const message =
-          err instanceof PenpotExporterError
-            ? `${err.message}: ${typeof err.body === 'string' ? err.body : JSON.stringify(err.body)}`
-            : err instanceof Error
-              ? err.message
-              : 'Unknown error'
         return {
-          content: [{ type: 'text' as const, text: message }],
+          content: [{ type: 'text' as const, text: formatExportToolError(err) }],
           isError: true,
         }
       }
@@ -165,14 +172,8 @@ export function registerExportTool(server: McpServer, exporter: PenpotExporterCl
           })),
         }
       } catch (err) {
-        const message =
-          err instanceof PenpotExporterError
-            ? `${err.message}: ${typeof err.body === 'string' ? err.body : JSON.stringify(err.body)}`
-            : err instanceof Error
-              ? err.message
-              : 'Unknown error'
         return {
-          content: [{ type: 'text' as const, text: message }],
+          content: [{ type: 'text' as const, text: formatExportToolError(err) }],
           isError: true,
         }
       }

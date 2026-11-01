@@ -816,36 +816,35 @@ Ideas for further reducing agent friction, roughly in priority order:
       either per-entry or via the top-level default) is done with `.refine()` on a
       separate `exportBatchInput` schema while `exportBatchBaseSchema` (the raw
       `ZodObject`) is passed to the MCP SDK's `inputSchema` to preserve `.shape`.)
-- [x] Stale-write detection via `revn` — every write tool
-      (`penpot_update_shapes`/`penpot_batch`/`penpot_restore_checkpoint`/etc.)
-      currently sends `update-file` blind, without checking the file's
-      current `revn` (revision number) first. If a human has the file open
-      in the Penpot editor and edits concurrently with an agent session,
-      whichever write lands second silently overwrites the other with no
-      error. Penpot's own `update-file` RPC takes a `revn` and is expected
-      to reject a change-set built against a stale one; today nothing here
-      reads or checks it beforehand. Fix is to fetch current `revn` before
-      writing and surface a clear "file changed underneath you, re-fetch
-      and retry" error on rejection, rather than actually merging concurrent
-      edits (which would need Penpot's own operational-transform logic).
-      (Done — `PenpotStaleWriteError` is thrown by `updateFile` in
-      `rpc-client.ts` whenever the `update-file` response includes a
-      non-empty `lagged` array, meaning Penpot applied change-sets from
-      another session before ours. Penpot's collaborative engine still
-      applies our write on top, so the write succeeds at the HTTP level,
-      but the error surfaces the concurrent-edit situation with a clear
-      message that names the new `revn` and tells the caller to re-fetch
-      via `penpot_get_file_snapshot` before making further edits. Applies
-      to all write tools automatically — `penpot_add_shapes`,
-      `penpot_update_shapes`, `penpot_delete_shapes`, `penpot_batch`,
-      `penpot_restore_checkpoint`, `penpot_group_shapes`,
-      `penpot_ungroup_shapes`, `penpot_clone_shapes`, `penpot_reorder_shapes`,
-      `penpot_align_shapes`, `penpot_distribute_shapes`, page CRUD, etc. —
-      since they all go through `updateFile`. `PenpotStaleWriteError`
-      carries `laggedCount` (number of concurrent change-sets) and `result`
-      (the full `update-file` response, including the new `revn`) so
-      callers that need the new revision can read it from the error rather
-      than requiring an additional round trip.)
+- [x] `update-file` response diagnostics — Every content MCP handler that
+      calls `updateFile` makes exactly one request and returns a `mutation`
+      object alongside its normal result fields:
+      `{ status: "applied"|"no-op", observedRevn, serverResponseRevn,
+      laggedCount }`. `observedRevn` is the revision read before building the
+      change-set; `serverResponseRevn` is the value reported by Penpot only for
+      an applied request, and is `null` for a no-op where no request was sent.
+      Neither is labelled as the current revision after the handler returns.
+      `laggedCount` is the number of server-reported lagged entries, or `null`
+      when Penpot omitted that field (and for no-op responses). Lagged entries,
+      session IDs, change IDs, and change content are never returned. A successful
+      mutation is never automatically retried. `status: "no-op"` means the handler
+      generated no changes and sent no `update-file` request; it does not mean a
+      restore found an otherwise nonempty checkpoint unchanged. Restore preserves
+      its established overwrite behavior, so a nonempty checkpoint can report
+      `"applied"` even when its snapshot already matches the current file.
+      Re-fetch with `penpot_get_file_snapshot` before a dependent follow-up edit
+      when current state matters.
+
+      Backward compatibility: mutation results still include `revn`. For an
+      applied request it is the legacy alias of `mutation.serverResponseRevn`;
+      for a no-op it is the legacy alias of `mutation.observedRevn`. New callers
+      should use the named `mutation` fields rather than infer current state from
+      `revn`.
+
+      Real non-2xx RPC responses are exposed at the MCP boundary as a structured
+      error with `method`, HTTP `status`, and an optional code from a fixed,
+      reviewed allowlist. Server response text and arbitrary response fields are
+      never reflected to the MCP caller.
 - [x] Version history / branching support — `penpot_list_file_snapshots` lists all named
       snapshots for a file (both user-created versions and system auto-backups);
       `penpot_create_file_snapshot` saves the current state as a named version (optional

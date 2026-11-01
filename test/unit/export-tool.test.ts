@@ -6,9 +6,10 @@
  * BatchExportSpec[] entirely in process.
  */
 
-import { describe, it, expect } from 'vitest'
-import { exportBatchInput, exportBatchBaseSchema } from '../../src/tools/export.js'
-import type { BatchExportSpec } from '../../src/exporter-client.js'
+import { describe, it, expect, vi } from 'vitest'
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { exportBatchInput, exportBatchBaseSchema, registerExportTool } from '../../src/tools/export.js'
+import { PenpotExporterError, type BatchExportSpec, type PenpotExporterClient } from '../../src/exporter-client.js'
 
 const FILE_ID = 'aaaaaaaa-0000-0000-0000-000000000000'
 const PAGE_ID_1 = 'bbbbbbbb-0000-0000-0000-000000000000'
@@ -227,5 +228,119 @@ describe('exportBatchBaseSchema', () => {
     expect(exportBatchBaseSchema.shape).toHaveProperty('shapes')
     expect(exportBatchBaseSchema.shape).toHaveProperty('format')
     expect(exportBatchBaseSchema.shape).toHaveProperty('scale')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Export tool error rendering
+// ---------------------------------------------------------------------------
+
+type ExportToolResponse = {
+  content: Array<{ type: 'text'; text: string }>
+  isError?: boolean
+}
+
+type RegisteredExportHandler = (input: unknown) => Promise<ExportToolResponse>
+
+function registeredExportHandlers(exporter: PenpotExporterClient): Map<string, RegisteredExportHandler> {
+  const registerTool = vi.fn()
+  registerExportTool({ registerTool } as unknown as McpServer, exporter)
+  const calls = registerTool.mock.calls as unknown as Array<[string, unknown, RegisteredExportHandler]>
+  return new Map(calls.map(([name, _config, handler]) => [name, handler]))
+}
+
+const hostileExporterFailures = [
+  {
+    method: 'login' as const,
+    status: 401,
+    body: 'login-message-should-not-leak auth-token=credential-should-not-leak https://login.example.test/private',
+  },
+  {
+    method: 'export' as const,
+    status: 502,
+    body: {
+      code: 'untrusted-server-code-should-not-leak',
+      message: 'export-message-should-not-leak',
+      authToken: 'credential-should-not-leak',
+      diagnosticsUrl: 'https://export.example.test/private',
+    },
+  },
+  {
+    method: 'download' as const,
+    status: 503,
+    body: {
+      error: 'download-message-should-not-leak',
+      nested: { password: 'credential-should-not-leak' },
+      url: 'https://download.example.test/private',
+    },
+  },
+]
+
+const exportToolInputs: Record<string, unknown> = {
+  penpot_export_shape: {
+    fileId: FILE_ID,
+    pageId: PAGE_ID_1,
+    shapeId: SHAPE_1,
+  },
+  penpot_export_batch: {
+    fileId: FILE_ID,
+    pageId: PAGE_ID_1,
+    shapeIds: [SHAPE_1],
+  },
+}
+
+describe.each(Object.entries(exportToolInputs))('%s exporter failures', (toolName, input) => {
+  it.each(hostileExporterFailures)(
+    'returns only structured method and status for a $method failure',
+    async ({ method, status, body }) => {
+      const error = new PenpotExporterError(method, status, body)
+      const exporter = {
+        exportShape: vi.fn().mockRejectedValue(error),
+        exportShapesBatch: vi.fn().mockRejectedValue(error),
+      } as unknown as PenpotExporterClient
+      const handler = registeredExportHandlers(exporter).get(toolName)
+
+      expect(handler).toBeDefined()
+      const response = await handler!(input)
+
+      expect(response.isError).toBe(true)
+      expect(response.content).toHaveLength(1)
+      const payload = JSON.parse(response.content[0]!.text) as {
+        error: { type: string; method: string; status: number; code?: string }
+      }
+      expect(payload).toEqual({
+        error: {
+          type: 'penpot-exporter-error',
+          method,
+          status,
+        },
+      })
+      expect(JSON.stringify(payload)).not.toContain('should-not-leak')
+      expect(JSON.stringify(payload)).not.toContain('example.test')
+      expect(JSON.stringify(payload)).not.toContain('credential-should-not-leak')
+    },
+  )
+})
+
+describe.each(Object.entries(exportToolInputs))('%s unexpected failures', (toolName, input) => {
+  it('does not expose an arbitrary error message that contains credentials', async () => {
+    const error = new Error(
+      'unexpected-server-message-should-not-leak auth-token=credential-should-not-leak https://unexpected.example.test/private',
+    )
+    const exporter = {
+      exportShape: vi.fn().mockRejectedValue(error),
+      exportShapesBatch: vi.fn().mockRejectedValue(error),
+    } as unknown as PenpotExporterClient
+    const handler = registeredExportHandlers(exporter).get(toolName)
+
+    expect(handler).toBeDefined()
+    const response = await handler!(input)
+
+    expect(response.isError).toBe(true)
+    const payload = JSON.parse(response.content[0]!.text) as { error: { type: string; code?: string } }
+    expect(payload).toEqual({ error: { type: 'penpot-export-tool-error' } })
+    expect(JSON.stringify(payload)).not.toContain('should-not-leak')
+    expect(JSON.stringify(payload)).not.toContain('example.test')
+    expect(JSON.stringify(payload)).not.toContain('credential-should-not-leak')
   })
 })
